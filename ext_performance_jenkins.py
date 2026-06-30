@@ -44,7 +44,9 @@ MYSQL_DB = os.environ["MYSQL_DB"]
 MYSQL_TABLE = "performance_vehicle_daily"
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "3000"))
 
-fleet_id_list = [f"{m:2d}" for m in range(1, 9)]
+# FIX: ใช้ str(m) ตรงๆ ไม่ใช่ f"{m:2d}" ซึ่งเติม space นำหน้า (" 1", " 2", ...)
+# space ที่ติดมาทำให้ server ไม่รู้จัก fleet_group_id แล้วคืน HTML แทน Excel
+fleet_id_list = [str(m) for m in range(1, 9)]
 
 HEADERS = {
     "Accept": (
@@ -93,11 +95,12 @@ def download_report_bytes(fleet_group_id, year, month):
 
     r.raise_for_status()
 
-    if "spreadsheetml" not in r.headers.get("Content-Type", ""):
-        raise RuntimeError("Not Excel response")
-
+    # FIX: ยึด magic bytes "PK" (zip header ของ .xlsx) เป็นเกณฑ์หลัก
+    # เชื่อถือได้กว่าการเช็ค Content-Type เพราะบาง server คืน Excel มาด้วย
+    # application/vnd.ms-excel หรือ application/octet-stream
     if not r.content.startswith(b"PK"):
-        raise RuntimeError("Invalid XLSX")
+        ct = r.headers.get("Content-Type", "")
+        raise RuntimeError(f"Not Excel response (Content-Type={ct})")
 
     return r.content
 
@@ -215,8 +218,8 @@ def main():
 
     logging.info(f"Target months: {target_months}")
 
-    delete_target_months(engine, target_months)
-
+    # ดาวน์โหลดให้ครบก่อน แล้วค่อยลบ-แทนที่ เพื่อไม่ให้ข้อมูลเดิมหาย
+    # ถ้า run ล้มเหลว (เช่น cookie หมดอายุ) ข้อมูลเดือนเป้าหมายจะยังอยู่
     raw = []
 
     for year, month in target_months:
@@ -243,6 +246,9 @@ def main():
 
     final_df = transform_performance(raw_df)
     logging.info(f"final rows: {len(final_df):,}")
+
+    # ลบเฉพาะตอนที่ดาวน์โหลดและ transform สำเร็จแล้วเท่านั้น
+    delete_target_months(engine, target_months)
 
     upsert_chunked(final_df, engine)
 
