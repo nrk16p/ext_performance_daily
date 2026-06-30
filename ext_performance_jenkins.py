@@ -44,6 +44,9 @@ MYSQL_DB = os.environ["MYSQL_DB"]
 MYSQL_TABLE = "performance_vehicle_daily"
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "3000"))
 
+# DEBUG ชั่วคราว: print body ของ response เฉพาะ failure ครั้งแรก
+_DEBUG_DONE = False
+
 # FIX: ใช้ str(m) ตรงๆ ไม่ใช่ f"{m:2d}" ซึ่งเติม space นำหน้า (" 1", " 2", ...)
 # space ที่ติดมาทำให้ server ไม่รู้จัก fleet_group_id แล้วคืน HTML แทน Excel
 fleet_id_list = [str(m) for m in range(1, 9)]
@@ -100,6 +103,15 @@ def download_report_bytes(fleet_group_id, year, month):
     # application/vnd.ms-excel หรือ application/octet-stream
     if not r.content.startswith(b"PK"):
         ct = r.headers.get("Content-Type", "")
+        # DEBUG ชั่วคราว: ดู body ของ HTML ที่ server คืนมา (เฉพาะครั้งแรก)
+        global _DEBUG_DONE
+        if not _DEBUG_DONE:
+            _DEBUG_DONE = True
+            logging.warning(f"--- DEBUG fleet={fleet_group_id} {year}-{month} ---")
+            logging.warning(f"STATUS: {r.status_code}")
+            logging.warning(f"REQUEST URL: {r.url}")
+            logging.warning(f"RESP HEADERS: {dict(r.headers)}")
+            logging.warning(f"BODY[:1500]: {r.text[:1500]}")
         raise RuntimeError(f"Not Excel response (Content-Type={ct})")
 
     return r.content
