@@ -1,5 +1,6 @@
 # =========================================================
 # PERFORMANCE PIPELINE - JENKINS READY (LAST 3 MONTHS)
+# Auth: session login (username/password) - no static cookie
 # =========================================================
 
 import os
@@ -31,9 +32,13 @@ logging.basicConfig(
 # CONFIG (FROM ENV)
 # ---------------------------------------------------------
 
-BASE_URL = "https://www.mena-atms.com/report/excel/index.excel/type/vehicle.availability"
+ATMS_BASE = "https://www.mena-atms.com"
+LOGIN_URL = f"{ATMS_BASE}/account/user/login"
+REPORT_URL = f"{ATMS_BASE}/report/excel/index.excel/type/vehicle.availability"
 
-COOKIE_STRING = os.environ["ATMS_COOKIE"]
+# เก็บเป็น Jenkins Credentials แล้วผูกผ่าน withCredentials (อย่า hardcode / อย่าใช้ env ธรรมดา)
+ATMS_USERNAME = os.environ["ATMS_USERNAME"]
+ATMS_PASSWORD = os.environ["ATMS_PASSWORD"]
 
 MYSQL_USER = os.environ["MYSQL_USER"]
 MYSQL_PASSWORD = quote_plus(os.environ["MYSQL_PASSWORD"])
@@ -44,23 +49,18 @@ MYSQL_DB = os.environ["MYSQL_DB"]
 MYSQL_TABLE = "performance_vehicle_daily"
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "3000"))
 
-# DEBUG ชั่วคราว: print body ของ response เฉพาะ failure ครั้งแรก
-_DEBUG_DONE = False
-
-# FIX: ใช้ str(m) ตรงๆ ไม่ใช่ f"{m:2d}" ซึ่งเติม space นำหน้า (" 1", " 2", ...)
-# space ที่ติดมาทำให้ server ไม่รู้จัก fleet_group_id แล้วคืน HTML แทน Excel
+# FIX: str(m) ไม่ใช่ f"{m:2d}" (ตัวหลังเติม space นำหน้า ทำให้ server ไม่รู้จัก fleet)
 fleet_id_list = [str(m) for m in range(1, 9)]
 
-HEADERS = {
+# headers ทั่วไป (ไม่มี Cookie แล้ว - session จัดการ cookie ให้เอง)
+BASE_HEADERS = {
     "Accept": (
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,"
         "application/octet-stream;q=0.9,*/*;q=0.8"
     ),
-    "Content-Type": "application/x-www-form-urlencoded",
-    "Origin": "https://www.mena-atms.com",
-    "Referer": "https://www.mena-atms.com/report/excel/index.excel/type/vehicle.availability",
+    "Origin": ATMS_BASE,
+    "Referer": REPORT_URL,
     "User-Agent": "Mozilla/5.0",
-    "Cookie": COOKIE_STRING,
 }
 
 # ---------------------------------------------------------
@@ -76,13 +76,44 @@ def get_last_n_months(n=3):
     ]
 
 # ---------------------------------------------------------
+# AUTH (SESSION LOGIN)
+# ---------------------------------------------------------
+
+def atms_login() -> requests.Session:
+    session = requests.Session()
+    session.headers.update(BASE_HEADERS)
+
+    resp = session.post(
+        LOGIN_URL,
+        data={
+            "username": ATMS_USERNAME,
+            "password": ATMS_PASSWORD,
+            "submit": "login",
+            "next": "",
+        },
+        verify=False,
+        timeout=30,
+        allow_redirects=True,
+    )
+    resp.raise_for_status()
+
+    # เช็คว่า login สำเร็จจริง: หน้า login ที่ผิดก็คืน 200 ได้ จึงต้องเช็คเพิ่ม
+    # หลัง login สำเร็จ server จะตั้ง session cookie ให้ และไม่พาเรากลับมาหน้า login
+    if not session.cookies:
+        raise RuntimeError("ATMS login failed: no session cookie set (check username/password)")
+    if "login" in resp.url:
+        raise RuntimeError(f"ATMS login failed: still on login page ({resp.url})")
+
+    logging.info("✅ ATMS login OK")
+    return session
+
+# ---------------------------------------------------------
 # DOWNLOAD
 # ---------------------------------------------------------
 
-def download_report_bytes(fleet_group_id, year, month):
-    r = requests.post(
-        BASE_URL,
-        headers=HEADERS,
+def download_report_bytes(session: requests.Session, fleet_group_id, year, month):
+    r = session.post(
+        REPORT_URL,
         data={
             "fleet_group_id": fleet_group_id,
             "fleet_id": "",
@@ -95,23 +126,14 @@ def download_report_bytes(fleet_group_id, year, month):
         timeout=60,
         verify=False,
     )
-
     r.raise_for_status()
 
-    # FIX: ยึด magic bytes "PK" (zip header ของ .xlsx) เป็นเกณฑ์หลัก
-    # เชื่อถือได้กว่าการเช็ค Content-Type เพราะบาง server คืน Excel มาด้วย
-    # application/vnd.ms-excel หรือ application/octet-stream
+    # ยึด magic bytes "PK" (zip header ของ .xlsx) เป็นเกณฑ์หลัก
     if not r.content.startswith(b"PK"):
         ct = r.headers.get("Content-Type", "")
-        # DEBUG ชั่วคราว: ดู body ของ HTML ที่ server คืนมา (เฉพาะครั้งแรก)
-        global _DEBUG_DONE
-        if not _DEBUG_DONE:
-            _DEBUG_DONE = True
-            logging.warning(f"--- DEBUG fleet={fleet_group_id} {year}-{month} ---")
-            logging.warning(f"STATUS: {r.status_code}")
-            logging.warning(f"REQUEST URL: {r.url}")
-            logging.warning(f"RESP HEADERS: {dict(r.headers)}")
-            logging.warning(f"BODY[:1500]: {r.text[:1500]}")
+        # ถ้าโดน redirect กลับหน้า login = session หลุด/ดาวน์โหลดนานเกินจน session หมดอายุ
+        if "login" in r.url:
+            raise RuntimeError(f"Session expired - redirected to login ({r.url})")
         raise RuntimeError(f"Not Excel response (Content-Type={ct})")
 
     return r.content
@@ -227,17 +249,17 @@ def main():
 
     engine = mysql_engine()
     target_months = get_last_n_months(3)
-
     logging.info(f"Target months: {target_months}")
 
-    # ดาวน์โหลดให้ครบก่อน แล้วค่อยลบ-แทนที่ เพื่อไม่ให้ข้อมูลเดิมหาย
-    # ถ้า run ล้มเหลว (เช่น cookie หมดอายุ) ข้อมูลเดือนเป้าหมายจะยังอยู่
-    raw = []
+    # login ครั้งเดียว ใช้ session ซ้ำทุก fleet+month
+    session = atms_login()
 
+    # ดาวน์โหลดให้ครบก่อน แล้วค่อยลบ-แทนที่ (run ล้มเหลว ข้อมูลเดิมไม่หาย)
+    raw = []
     for year, month in target_months:
         for fleet in fleet_id_list:
             try:
-                content = download_report_bytes(fleet, year, month)
+                content = download_report_bytes(session, fleet, year, month)
                 df = bytes_to_df(content)
 
                 df["fleet_group_id"] = fleet.strip()
@@ -259,9 +281,8 @@ def main():
     final_df = transform_performance(raw_df)
     logging.info(f"final rows: {len(final_df):,}")
 
-    # ลบเฉพาะตอนที่ดาวน์โหลดและ transform สำเร็จแล้วเท่านั้น
+    # ลบเฉพาะตอนที่ดาวน์โหลด + transform สำเร็จแล้วเท่านั้น
     delete_target_months(engine, target_months)
-
     upsert_chunked(final_df, engine)
 
     logging.info("🎉 Jenkins job finished successfully")
